@@ -8,14 +8,13 @@ mod fmt;
 
 #[rtic::app(device = rp_pico::hal::pac, peripherals = true)]
 mod app {
-
-    use crate::fmt::Wrapper;
-    use core::fmt::Write;
+    use defmt::info;
     use embedded_hal::digital::v2::OutputPin;
     use embedded_time::duration::Extensions;
+    use debounced_pin::{DebouncedInputPin, ActiveHigh, DebounceState, Debounce};
 
+    use hal::gpio::Interrupt;
     use rp_pico::hal;
-    use rp_pico::pac;
     use rp_pico::XOSC_CRYSTAL_FREQ;
 
     // USB Device support
@@ -52,47 +51,38 @@ mod app {
     // Global Static variable, has to be written inside unsafe blocks.
     // A reference can be obtained with as_ref() method.
 
-    pub struct Counter {
-        counter: u32,
-        enable: bool,
-    }
+    type RedLedPin = hal::gpio::Pin<
+        hal::gpio::bank0::Gpio13,
+        hal::gpio::PushPullOutput,
+    >;
 
-    impl Counter {
-        fn new() -> Self {
-            Counter {
-                counter: 0_u32,
-                enable: true,
-            }
-        }
+    type YellowLedPin = hal::gpio::Pin<
+        hal::gpio::bank0::Gpio15,
+        hal::gpio::PushPullOutput,
+    >;
+    type GreenLedPin = hal::gpio::Pin<
+        hal::gpio::bank0::Gpio16,
+        hal::gpio::PushPullOutput,
+    >;
 
-        fn get(&self) -> u32 {
-            self.counter
-        }
-
-        fn reset(&mut self) {
-            self.counter = 0_u32;
-        }
-
-        fn increment(&mut self) {
-            self.counter += 1_u32;
-        }
-
-        fn enable(&mut self, state: bool) {
-            self.enable = state;
-        }
-    }
+    type ButtonPin = DebouncedInputPin<
+        hal::gpio::Pin<
+            hal::gpio::bank0::Gpio14,
+            hal::gpio::PullUpInput,
+        >,
+        ActiveHigh,
+    >;
 
     #[shared]
     struct Shared {
-        timer: hal::Timer,
-        alarm: hal::timer::Alarm0,
-        led: hal::gpio::Pin<hal::gpio::pin::bank0::Gpio25, hal::gpio::PushPullOutput>,
-        led_blink_enable: bool,
+        // timer: hal::Timer,
+        // alarm: hal::timer::Alarm0,
 
-        serial: SerialPort<'static, hal::usb::UsbBus>,
-        usb_dev: usb_device::device::UsbDevice<'static, hal::usb::UsbBus>,
-
-        counter: Counter,
+        red_led: RedLedPin,
+        yellow_led: YellowLedPin,
+        green_led: GreenLedPin,
+        button: ButtonPin,
+        state: i32,
     }
 
     #[local]
@@ -138,10 +128,10 @@ mod app {
                 )));
 
         // Set up the USB Communications Class Device driver.
-        let serial = SerialPort::new(usb_bus);
+        let _serial = SerialPort::new(usb_bus);
 
         // Create a USB device with a fake VID and PID
-        let usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x16c0, 0x27dd))
+        let _usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x16c0, 0x27dd))
             .manufacturer("Fake company")
             .product("Serial port")
             .serial_number("TEST")
@@ -158,34 +148,36 @@ mod app {
             sio.gpio_bank0,
             &mut resets,
         );
-        let mut led = pins.led.into_push_pull_output();
-        led.set_low().unwrap();
 
-        let mut timer = hal::Timer::new(c.device.TIMER, &mut resets);
-        let mut alarm = timer.alarm_0().unwrap();
-        let _ = alarm.schedule(SCAN_TIME_US.microseconds());
-        alarm.enable_interrupt(&mut timer);
-
-        // Enable led_blink.
-        let led_blink_enable = true;
-
-        // Reset the counter
-        let counter = Counter::new();
-
+        // let mut timer = hal::Timer::new(c.device.TIMER, &mut resets);
+        // let mut alarm = timer.alarm_0().unwrap();
+        // let _ = alarm.schedule(SCAN_TIME_US.microseconds());
+        // alarm.enable_interrupt(&mut timer);
+        
+        let button = pins.gpio14.into_pull_up_input();
+        button.set_interrupt_enabled(Interrupt::EdgeLow, true);
+        let button = DebouncedInputPin::new(button, ActiveHigh);
+        
+        let red_led = pins.gpio13.into_push_pull_output();
+        let yellow_led = pins.gpio15.into_push_pull_output();
+        let green_led = pins.gpio16.into_push_pull_output();
+        let state = 0;
+        
+        
+        rtic::pend(hal::pac::Interrupt::IO_IRQ_BANK0);
+        info!("init");
         //********
         // Return the Shared variables struct, the Local variables struct and the XPTO Monitonics
         //    (Note: Read again the RTIC book in the section of Monotonics timers)
         (
             Shared {
-                timer,
-                alarm,
-                led,
-                led_blink_enable,
+                
+                button,
+                red_led,
+                yellow_led,
+                green_led,
+                state,
 
-                serial,
-                usb_dev,
-
-                counter,
             },
             Local {},
             init::Monotonics(),
@@ -194,143 +186,66 @@ mod app {
 
     /// Task that blinks the rp-pico onboard LED and that send a message "LED ON!" and "LED OFF!" do USB-Serial.
     #[task(
-        binds = TIMER_IRQ_0,
+        binds = IO_IRQ_BANK0,
         priority = 1,
-        shared = [timer, alarm, led, led_blink_enable,  serial, counter],
-        local = [tog: bool = true],
+        shared = [red_led, yellow_led, green_led, button, state],
+        local = [],
     )]
-    fn timer_irq(mut cx: timer_irq::Context) {
-        let mut buf = [0u8; 64];
+    fn io_bank0(cx: io_bank0::Context) {
+        info!("io_bank0");
+        let red_led = cx.shared.red_led;
+        let yellow_led = cx.shared.yellow_led;
+        let green_led = cx.shared.green_led;
+        let button = cx.shared.button;
+        let state = cx.shared.state;
 
-        let led = cx.shared.led;
-        let led_blink_enable = cx.shared.led_blink_enable;
-        let counter = cx.shared.counter;
 
-        let tog = cx.local.tog;
-
-        // Blinks the LED ON / OFF.
-        (led, led_blink_enable, counter).lock(|led_a, led_blink_enable_a, counter_a| {
-            let led_state_str: &str;
-            if *led_blink_enable_a {
-                if *tog {
-                    led_a.set_high().unwrap();
-                    led_state_str = "ON ";
-                } else {
-                    led_a.set_low().unwrap();
-                    led_state_str = "OFF";
-                }
-                let _ = writeln!(
-                    Wrapper::new(&mut buf),
-                    "LED {}!   counter = {}",
-                    led_state_str,
-                    counter_a.get()
-                );
-            }
-            if counter_a.enable {
-                counter_a.increment();
-            }
-
-            if *led_blink_enable_a {
-                *tog = !*tog;
-            }
-        });
-
-        // Clears the timer interrupt and Set's the new delta_time in the future.
-        let mut timer = cx.shared.timer;
-        let mut alarm = cx.shared.alarm;
-        (alarm).lock(|a| {
-            (timer).lock(|timer_a| {
-                a.clear_interrupt(timer_a);
-                let _ = a.schedule(SCAN_TIME_US.microseconds());
-            });
-        });
-
-        // Write the message "blabla! 2" do USB-Serial.
-        cx.shared.serial.lock(|s| {
-            write_serial(s, unsafe { core::str::from_utf8_unchecked(&buf) }, false);
-        });
-
-        /*
-        // Write the message "blabla! 2" do USB-Serial.
-        c.shared.serial.lock(|s| {
-            let mut buf = [0u8; 64];
-            let _ = writeln!(Wrapper::new(&mut buf), "blabla! {}", 2); /*"{:?}"*/
-            write_serial(s, unsafe { core::str::from_utf8_unchecked(&buf) }, false);
-        });
-        */
-    }
-
-    /// Usb interrupt handler. Runs every time the host requests new data.
-    #[task(binds = USBCTRL_IRQ, priority = 3, shared = [led, led_blink_enable, serial, usb_dev, counter])]
-    fn usb_rx(cx: usb_rx::Context) {
-        let led = cx.shared.led;
-        let led_blink_enable = cx.shared.led_blink_enable;
-
-        let usb_dev = cx.shared.usb_dev;
-        let serial = cx.shared.serial;
-        let counter = cx.shared.counter;
-
-        (led, led_blink_enable, usb_dev, serial, counter).lock(
-            |led_a, led_blink_enable_a, usb_dev_a, serial_a, counter_a| {
-                // Check for new data
-                if usb_dev_a.poll(&mut [serial_a]) {
-                    let mut buf = [0u8; 64];
-                    match serial_a.read(&mut buf) {
-                        Err(_e) => {
-                            // Do nothing
-                            // let _ = serial_a.write(b"Error.");
-                            // let _ = serial_a.flush();
+        (
+            red_led,
+            yellow_led,
+            green_led,
+            button,
+            state
+        ).lock(|
+            red_led,
+            yellow_led,
+            green_led,
+            button,
+            state
+            | {
+            match button.update().unwrap() {
+                DebounceState::Debouncing => return,
+                DebounceState::Reset => return,
+                DebounceState::NotActive => return,
+                DebounceState::Active => {
+                    match state {
+                        0 => {
+                            red_led.set_high().unwrap();
+                            yellow_led.set_low().unwrap();
+                            green_led.set_low().unwrap();
                         }
-                        Ok(0) => {
-                            // Do nothing
-                            let _ = serial_a.write(b"Didn't received data.");
-                            let _ = serial_a.flush();
+                        1 => {
+                            red_led.set_low().unwrap();
+                            yellow_led.set_high().unwrap();
+                            green_led.set_low().unwrap();
                         }
-                        Ok(_count) => {
-                            match_usb_serial_buf(
-                                &buf,
-                                led_a,
-                                led_blink_enable_a,
-                                serial_a,
-                                counter_a,
-                            );
-
-                            /*
-                            // Code to echo the characters in Upper Case.
-
-                            // Convert to upper case
-                            buf.iter_mut().take(count).for_each(|b| {
-                                b.make_ascii_uppercase();
-                            });
-                            if count > 0 {
-                                let _ = serial_a.write(b"Received data! ");
-                                let _ = serial_a.flush();
-                            }
-
-                            // Send back to the host
-                            let mut wr_ptr = &buf[..count];
-                            while !wr_ptr.is_empty() {
-                                match serial_a.write(wr_ptr) {
-                                    Ok(len) => {
-                                        wr_ptr = &wr_ptr[len..];
-                                        // if wr_ptr.len() == 0 {
-                                        // let _ = serial_a.write(b"");
-                                        let _ = serial_a.flush();
-                                        // }
-                                    }
-                                    // On error, just drop unwritten data.
-                                    // One possible error is Err(WouldBlock), meaning the USB
-                                    // write buffer is full.
-                                    Err(_) => break,
-                                };
-                            }
-
-                            */
+                        2 => {
+                            red_led.set_low().unwrap();
+                            yellow_led.set_low().unwrap();
+                            green_led.set_high().unwrap();
                         }
+                        _ => {}
                     }
+                    *state += 1;
+    
+                    if *state > 2 {
+                        *state = 0;
+                    }
+    
+                    button.pin.clear_interrupt(hal::gpio::Interrupt::EdgeLow);
                 }
-            },
-        );
+            }
+        });
     }
 
     // Task with least priority that only runs when nothing else is running.
@@ -338,9 +253,9 @@ mod app {
     fn idle(_cx: idle::Context) -> ! {
         // Locals in idle have lifetime 'static
         // let _x: &'static mut u32 = cx.local.x;
-
+        info!("idle");
         //hprintln!("idle").unwrap();
-
+        rtic::pend(hal::pac::Interrupt::IO_IRQ_BANK0);
         loop {
             cortex_m::asm::nop();
         }
@@ -348,176 +263,4 @@ mod app {
 
     /* New Tasks */
 
-    /// This function come from the github with USB-Serial example (see link above).
-    ///
-    /// Helper function to ensure all data is written across the serial interface.
-    fn write_serial(serial: &mut SerialPort<'static, hal::usb::UsbBus>, buf: &str, block: bool) {
-        let write_ptr = buf.as_bytes();
-
-        // Because the buffer is of constant size and initialized to zero (0) we here
-        // add a test to determine the size that's really occupied by the str that we
-        // wan't to send. From index zero to first byte that is as the zero byte value.
-        let mut index = 0;
-        while index < write_ptr.len() && write_ptr[index] != 0 {
-            index += 1;
-        }
-        let mut write_ptr = &write_ptr[0..index];
-
-        while !write_ptr.is_empty() {
-            match serial.write(write_ptr) {
-                Ok(len) => write_ptr = &write_ptr[len..],
-                // Meaning the USB write buffer is full
-                Err(UsbError::WouldBlock) => {
-                    if !block {
-                        break;
-                    }
-                }
-                // On error, just drop unwritten data.
-                Err(_) => break,
-            }
-        }
-        // let _ = serial.write("\n".as_bytes());
-        let _ = serial.flush();
-    }
-
-    fn match_usb_serial_buf(
-        buf: &[u8; 64],
-        led: &mut hal::gpio::Pin<hal::gpio::pin::bank0::Gpio25, hal::gpio::PushPullOutput>,
-        led_blink_enable: &mut bool,
-        serial: &mut SerialPort<'static, hal::usb::UsbBus>,
-        counter: &mut Counter,
-    ) {
-        let _buf_len = buf.len();
-        match buf[0] {
-            // Print Menu
-            b'M' | b'm' => {
-                write_serial(serial, "M - Print Menu\n", false);
-                print_menu(serial);
-            }
-            // 0 - Reset counter
-            b'0' => {
-                write_serial(serial, "M - Print Menu\n", false);
-                counter.reset();
-            }
-            // 1 - Increment counter
-            b'1' => {
-                write_serial(serial, "1 - Increment counter\n", false);
-                counter.increment();
-            }
-            // 2 - Start continues counter
-            b'2' => {
-                write_serial(serial, "2 - Start continues counter\n", false);
-                counter.enable(true);
-            }
-            // 3 - Stop continues counter
-            b'3' => {
-                write_serial(serial, "3 - Stop continues counter\n", false);
-                counter.enable(false);
-            }
-            // 4 - Get switch and LED state
-            b'4' => {
-                write_serial(serial, "4 - Get switch and LED state\n", false);
-
-                // GPIO 25 onboard LED, we are going to read the bit 8 of the gpio_status register.
-                //  OUTFROMPERI - output signal from selected peripheral, before register
-                //                override is applied.
-                // See pag 272 of the Pico Datasets:
-                // https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf#_gpio_functions
-
-                let led_status_reg =
-                    unsafe { (*pac::IO_BANK0::ptr()).gpio[25].gpio_status.read().bits() };
-
-                // Reserved bit.
-                // let sio_pin_value = unsafe { (*pac::SIO::ptr()).gpio_out.read().bits() };
-
-                let (led_bool, led_status) = if ((led_status_reg & 1 << 8) >> 8) == 1_u32 {
-                    (true, "ON")
-                } else {
-                    (false, "OFF")
-                };
-
-                let mut buf = [0u8; 64];
-                let _ = writeln!(
-                    Wrapper::new(&mut buf),
-                    "LED Status {:b}, {}   LED {}",
-                    led_status_reg,
-                    led_bool,
-                    led_status
-                );
-                write_serial(
-                    serial,
-                    unsafe { core::str::from_utf8_unchecked(&buf) },
-                    false,
-                );
-
-                // unsafe { (*pac::TIMER::ptr()).timerawh.read().bits() };
-            }
-            // 5 - Set LED on
-            b'5' => {
-                write_serial(serial, "5 - Set LED on\n", false);
-                *led_blink_enable = false;
-                let _ = led.set_high();
-            }
-            // 6 - Set LED off
-            b'6' => {
-                write_serial(serial, "6 - Set LED off\n", false);
-                *led_blink_enable = false;
-                let _ = led.set_low();
-            }
-            // 7 - Set LED blink enable
-            b'7' => {
-                write_serial(serial, "7 - Set LED blink enable\n", false);
-                *led_blink_enable = true;
-            }
-            b'8' => {
-                write_serial(serial, "8 - Display data rate\n", false);
-
-                let data_rate = serial.line_coding().data_rate();
-                let mut buf = [0u8; 64];
-                let _ = writeln!(Wrapper::new(&mut buf), "Data rate: {} bit/s", data_rate);
-                write_serial(
-                    serial,
-                    unsafe { core::str::from_utf8_unchecked(&buf) },
-                    false,
-                );
-            }
-            _ => {
-                write_serial(
-                    serial,
-                    unsafe { core::str::from_utf8_unchecked(buf) },
-                    false,
-                );
-                write_serial(serial, "Invalid option!\n", false);
-            }
-        }
-    }
-
-    fn print_menu(serial: &mut SerialPort<'static, hal::usb::UsbBus>) {
-        let mut _buf = [0u8; 273];
-
-        // Create the Menu.
-        let menu_str = "*****************
-*  Menu:
-*
-*  M / m - Print menu
-*    0   - Reset counter
-*    1   - Increment counter
-*    2   - Start continues counter
-*    3   - Stop continues counter
-*    4   - Get switch and LED state
-*    5   - Set LED on
-*    6   - Set LED off
-*    7   - Set LED blink enable
-*    8   - Display data rate
-*****************
-Enter option: ";
-
-        write_serial(serial, menu_str, true);
-
-        // Send out the data to USB-Serial.
-        // let _ = serial.write(menu_str);
-
-        // let _ = writeln!(Wrapper::new(&mut buf), &menu_str);
-        // write_serial(serial, unsafe { core::str::from_utf8_unchecked(menu_str) });
-    }
 }
