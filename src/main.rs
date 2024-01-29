@@ -8,7 +8,6 @@ mod fmt;
 
 #[rtic::app(device = rp_pico::hal::pac, peripherals = true)]
 mod app {
-    use defmt::info;
     use embedded_hal::digital::v2::OutputPin;
     use debounced_pin::{DebouncedInputPin, ActiveHigh, DebounceState, Debounce};
 
