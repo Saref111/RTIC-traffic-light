@@ -5,29 +5,15 @@ use defmt_rtt as _;
 use panic_halt as _;
 
 mod fmt;
-
+mod lights;
 #[rtic::app(device = rp_pico::hal::pac, peripherals = true)]
 mod app {
-    use embedded_hal::digital::v2::OutputPin;
     use debounced_pin::{DebouncedInputPin, ActiveHigh, DebounceState, Debounce};
 
     use hal::gpio::Interrupt;
     use rp_pico::hal;
-    
 
-    type RedLedPin = hal::gpio::Pin<
-        hal::gpio::bank0::Gpio13,
-        hal::gpio::PushPullOutput,
-    >;
-
-    type YellowLedPin = hal::gpio::Pin<
-        hal::gpio::bank0::Gpio15,
-        hal::gpio::PushPullOutput,
-    >;
-    type GreenLedPin = hal::gpio::Pin<
-        hal::gpio::bank0::Gpio16,
-        hal::gpio::PushPullOutput,
-    >;
+    use crate::lights::TrafficLight;
 
     type ButtonPin = DebouncedInputPin<
         hal::gpio::Pin<
@@ -39,9 +25,7 @@ mod app {
 
     #[shared]
     struct Shared {
-        red_led: RedLedPin,
-        yellow_led: YellowLedPin,
-        green_led: GreenLedPin,
+        traffic_light: TrafficLight,
         button: ButtonPin,
         state: i32,
     }
@@ -70,15 +54,18 @@ mod app {
         let yellow_led = pins.gpio15.into_push_pull_output();
         let green_led = pins.gpio16.into_push_pull_output();
         let state = 0;
-        
+
+        let traffic_light = TrafficLight::new(
+            red_led,
+            yellow_led,
+            green_led,
+        );        
         
         rtic::pend(hal::pac::Interrupt::IO_IRQ_BANK0);
         (
             Shared {
+                traffic_light,
                 button,
-                red_led,
-                yellow_led,
-                green_led,
                 state,
             },
             Local {},
@@ -88,29 +75,18 @@ mod app {
 
     #[task(
         binds = IO_IRQ_BANK0,
-        shared = [red_led, yellow_led, green_led, button, state]
+        shared = [traffic_light, button, state]
     )]
     fn io_bank0(cx: io_bank0::Context) {
-        let red_led = cx.shared.red_led;
-        let yellow_led = cx.shared.yellow_led;
-        let green_led = cx.shared.green_led;
+        let traffic_light = cx.shared.traffic_light;
         let button = cx.shared.button;
         let state = cx.shared.state;
 
-
         (
-            red_led,
-            yellow_led,
-            green_led,
+            traffic_light,
             button,
             state
-        ).lock(|
-            red_led,
-            yellow_led,
-            green_led,
-            button,
-            state
-            | {
+        ).lock(|traffic_light, button,state| {
             match button.update().unwrap() {
                 DebounceState::Debouncing => return,
                 DebounceState::Reset => return,
@@ -118,25 +94,19 @@ mod app {
                 DebounceState::Active => {
                     match state {
                         1 => {
-                            red_led.set_low().unwrap();
-                            yellow_led.set_high().unwrap();
-                            green_led.set_low().unwrap();
+                            traffic_light.yellow();
                         }
                         2 => {
-                            red_led.set_low().unwrap();
-                            yellow_led.set_low().unwrap();
-                            green_led.set_high().unwrap();
+                            traffic_light.green();
                         }
                         _ => {
-                            red_led.set_high().unwrap();
-                            yellow_led.set_low().unwrap();
-                            green_led.set_low().unwrap();
+                            traffic_light.red();
                             *state = 0;
                         }
                     }
                     *state += 1;
     
-                    button.pin.clear_interrupt(hal::gpio::Interrupt::EdgeLow);
+                    button.pin.clear_interrupt(Interrupt::EdgeLow);
                 }
             }
         });
