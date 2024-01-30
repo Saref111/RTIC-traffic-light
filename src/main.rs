@@ -4,7 +4,6 @@
 use defmt_rtt as _;
 use panic_halt as _;
 
-mod fmt;
 mod lights;
 #[rtic::app(device = rp_pico::hal::pac, peripherals = true)]
 mod app {
