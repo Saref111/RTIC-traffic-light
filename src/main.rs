@@ -27,7 +27,6 @@ mod app {
     struct Shared {
         traffic_light: TrafficLight,
         button: ButtonPin,
-        state: i32,
     }
 
     #[local]
@@ -53,7 +52,6 @@ mod app {
         let red_led = pins.gpio13.into_push_pull_output();
         let yellow_led = pins.gpio15.into_push_pull_output();
         let green_led = pins.gpio16.into_push_pull_output();
-        let state = 0;
 
         let traffic_light = TrafficLight::new(
             red_led,
@@ -66,7 +64,6 @@ mod app {
             Shared {
                 traffic_light,
                 button,
-                state,
             },
             Local {},
             init::Monotonics(),
@@ -75,37 +72,19 @@ mod app {
 
     #[task(
         binds = IO_IRQ_BANK0,
-        shared = [traffic_light, button, state]
+        shared = [traffic_light, button]
     )]
     fn io_bank0(cx: io_bank0::Context) {
         let traffic_light = cx.shared.traffic_light;
         let button = cx.shared.button;
-        let state = cx.shared.state;
 
-        (
-            traffic_light,
-            button,
-            state
-        ).lock(|traffic_light, button,state| {
+        (traffic_light, button).lock(|traffic_light, button| {
             match button.update().unwrap() {
                 DebounceState::Debouncing => return,
                 DebounceState::Reset => return,
                 DebounceState::NotActive => return,
                 DebounceState::Active => {
-                    match state {
-                        1 => {
-                            traffic_light.yellow();
-                        }
-                        2 => {
-                            traffic_light.green();
-                        }
-                        _ => {
-                            traffic_light.red();
-                            *state = 0;
-                        }
-                    }
-                    *state += 1;
-    
+                    traffic_light.update();    
                     button.pin.clear_interrupt(Interrupt::EdgeLow);
                 }
             }
